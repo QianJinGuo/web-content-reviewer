@@ -1,242 +1,308 @@
 ---
 name: web-content-reviewer
-description: "Peer-review any web article or blog post and save high-quality ones to Obsidian wiki using llm-wiki standards. Double scoring: article value + confidence. Strict standards, no shallow content."
-version: "1.0"
+description: "Strictly review web articles and save only qualifying high-value sources to the Obsidian wiki using llm-wiki completion gates. Use for URL review, scoring, ingest decisions, wiki save workflows, review metadata, and explicit success/failure closeouts."
+version: "1.1"
 author: user
-related_skills: [llm-wiki]
+related_skills: [llm-wiki, tinyfish-web-agent]
 ---
 
 # Web Content Reviewer
 
-Peer-review any web article or blog post and save high-quality ones to the Obsidian wiki.
+Peer-review web articles and ingest only high-quality, credible material into the wiki.
+
+## 评分策略选择指南（2026-05-12 实践总结）
+
+### 背景
+
+评分 pipeline 有两个引擎：**Heuristic Scoring**（确定性、零成本）和 **LLM Scoring**（更智能、但依赖 API 稳定性）。
+
+实际使用中发现：
+- **MiniMax-M2.7 结构化输出持续损坏** — 返回 ` thinks` XML 标签包裹的 evaluation-prompt 而非 `{"review_value":N,"review_confidence":N}` JSON。即使 strip 标签后提取也可能失败。这不是偶发问题，已持续多轮 cron（横跨数天）。
+- **Heuristic 对不同来源有系统性偏差** — 微信公众号文章因 HTML→Markdown 转换丢失标题层级、代码围栏、外链，天然得分低（max 42/49）。RSS 文章格式较好，得分可达 56+。
+
+### 决策原则
+
+| 情况 | 推荐方案 | 理由 |
+|------|----------|------|
+| LLM API 结构化输出可靠 | LLM 评分 | 更准确，理解深层技术价值 |
+| LLM API 不稳定/返回非 JSON | **纯 Heuristic** | 确定性，无 API flakiness |
+| 来源为微信公众号 | **Heuristic ≥25** | 格式特殊导致 baseline 偏低 |
+| 来源为 RSS/Newsletter | **Heuristic ≥30** | 格式较好，阈值可设高 |
+| 混合来源、需要一致性 | **纯 Heuristic + 按源阈值** | 同一标准、不同基线 |
+
+### 统一评分门槛
+
+```
+所有来源统一：value × confidence >= 49
+```
+
+**硬性长度门槛**（char_count 为 markdown 原文 stripped 后的字符数）：
+
+| char_count | 决策 |
+|------------|------|
+| < 1500     | **最严格审核**：要求极高的技术密度和独特性才可入库（char_count 越小越难通过） |
+| 1500-3000  | 正常评分，需 value × confidence >= 49 |
+| > 3000     | 正常评分 |
+
+> 注意：微信文章因 HTML→Markdown 转换丢失标题层级、代码块、外链，格式损失不影响评分门槛。heuristic/llm 均使用同一乘积门槛，不再按源分别设阈值。
+
+### 为什么纯 Heuristic 在特定环境下是最佳实践
+
+1. **确定性** — 同一篇文章永远得同一分，可预测、可 debug
+2. **零成本** — 不需要调 API，适合批量场景（80 篇/20min）
+3. **快** — 毫秒级评分，无网络延迟
+4. **简单** — 一个函数、多个阈值、零回退路径
+5. **LLM 的优势被 API 不可靠性抵消** — 一个返回 ` thinks` 标签的 LLM 比 heuristic 更不可靠
+
+### 何时应该用 LLM
+
+- LLM provider 能稳定输出结构化 JSON（已验证过，不是 MiniMax 当前状态）
+- 需要理解**文章深层的技术价值**（heuristic 只能检测表面特征）
+- 单篇评估，不涉及批量
+- 愿意接受偶尔的 API 失败回退
+
+### URL 去重：只用黑名单，不用 frontmatter
+
+```
+ingested: 字段不可靠！
+  - wechat-mp-rss-extractor 写入 frontmatter 的 ingested: 日期不代表真正入库
+  - cron 中断时可能只写了 frontmatter 没创建 raw/articles/ 文件
+  - 正确做法：只查 raw/articles/*.md 的 source_url:/url: 字段
+```
 
 ## Trigger
 
-When the user sends ANY web article or blog post link (WeChat mp.weixin.qq.com, 微信公众号, 知乎 zhihu.com, 掘金 juejin.cn, CSDN, 博客园, Medium, dev.to, GitHub issues/README, ArXiv, or any public URL) and asks to review/summarize/save/ingest it into the knowledge base.
+Use this skill when the user provides a web article, blog post, GitHub page, paper page, WeChat article, Zhihu post, Juejin/CSDN/Blogyuan page, Medium/dev.to post, or public URL and asks to review, summarize, save, or ingest it into the knowledge base.
 
-## Role
+## Outcome Contract
 
-Act as a strict peer reviewer. Judge every article independently. Save only high-quality content to the Obsidian wiki at `~/wiki` (which IS the Obsidian vault). Reject shallow, repetitive, or low-credibility content.
+The workflow has two phases:
+1. Score first and explain the decision.
+2. If `value * confidence >= 49`, immediately complete wiki ingest before moving on.
 
-## Double Scoring System
+No middle state counts as success. A qualifying article that was scored but not saved is a workflow failure.
 
-### 1. Article Value (0-10)
-Content quality and incremental value to the knowledge base.
+## Scoring Gate
 
-| Score | Meaning |
-|-------|---------|
-| 9-10 | Must save: source-code-level depth / new domain / strong cognitive refresh |
-| 7-8 | Worth saving: systematic knowledge increment, fills a gap |
-| 5-6 | Reference only: local highlights, similar content already in knowledge base |
-| 0-4 | Do not save: shallow, repetitive, low technical value |
+Use double scoring:
+- `review_value` (0-10): article depth and incremental value to the wiki.
+- `review_confidence` (0-10): credibility and verifiability.
 
-### 2. Confidence (0-10)
-Credibility of the article / author / source. How verifiable are the claims?
+**Mandatory pre-scoring step — classify content type first:**
 
-| Score | Source Type | Characteristics |
-|-------|-------------|-----------------|
-| 9-10 | First-hand source code analysis, official tech blog, GitHub-verified | Has specific code, data, citations; not secondhand |
-| 7-8 | Original work from known tech communities (Alibaba Cloud/Taobao/DataSTUDIO/etc.) | Author named with proven practice; content cross-verifiable |
-| 5-6 | Industry observation/reviews/secondhand interpretation | No source code/data, opinion-based, relies on author's judgment |
-| 3-4 | Republished summary, quick news | Secondhand, no independent verification, factual doubts |
-| 0-2 | Marketing content, unverified rumors | Not credible |
+1. Classify article type: `technical` / `analysis` / `news` / `tutorial` / `lifestyle` / `marketing`
+2. Apply v/c mismatch corrections before computing v×c gate (see rubric)
+3. Apply frontier-inclusive principle when article captures new perspectives from credible sources
+4. Then evaluate `review_value * review_confidence >= 49`
 
-## Decision Matrix
+**Note on borderline cases:** `46 <= v×c <= 52` does NOT require human confirmation — auto-ingest is correct. The frontier-inclusive principle and v/c mismatch corrections together handle most false-positive risks. Trust the rubric.
 
-**Threshold rule: Value × Confidence ≥ 49 must be met to save.**
-
-| Value × Confidence | Action |
-|-------------------|--------|
-| ≥ 49 | Save |
-| < 49 | ❌ Do not save — no exceptions |
-
-> Important: Even if Value ≥ 7 and Confidence ≥ 7 individually, if the product is < 49, do NOT save. Example: Value 6 × Confidence 7 = 42 < 49 → do not save.
-
-No "middle ground" — articles either meet the threshold or they don't.
-
-**Strict rule: If threshold (≥49) IS met, the article MUST be saved. Do not skip, do not skip for later, do not note it and move on. Every qualifying article must be immediately入库.**
-
-When saving a reviewed article into the wiki, persist the review result as frontmatter metadata:
-- `review_value: X`
-- `review_confidence: Y`
-- `review_recommendation: strong | worth-reading | reference`
-- `review_stars: 1-5` (optional quick visual signal)
-
-Do **not** store these as tags. Tags are reserved for topic taxonomy; review signals are ranking metadata.
-
-Use this normalization so review metadata stays comparable across articles:
-- `review_recommendation: strong` when `value >= 8` and `confidence >= 7`
-- `review_recommendation: worth-reading` when the article is saved but does not meet the `strong` bar
-- `review_recommendation: reference` only for lower-priority scored notes kept outside the main wiki workflow
-- `review_stars: 5` for `value >= 9` and `confidence >= 8`
-- `review_stars: 4` for strong saves that do not reach the top tier
-- `review_stars: 3` for standard worthwhile saves
-- Avoid `review_stars: 1-2` for main wiki ingest unless you intentionally keep low-priority reviewed material
-
-## Review Criteria
-
-1. **Depth** — Source-code-level analysis, specific data, principle-level insights? Reject empty summaries/news flashes/basic popular science
-2. **Uniqueness** — New knowledge not in my wiki? Does it surpass or repeat existing articles?
-3. **Practical Value** — Guides practice (tool usage, architecture design, tech decisions, code writing)?
-4. **Technical Content** — Author with practical experience (source code > official release > republished info)?
-5. **Timeliness** — Key node in current AI/Agent wave (Self-Evolving, RL training loops, tool abstraction, etc.)?
-
-## Content Extraction Techniques
-
-### WeChat/MpWeixin Articles
-
-WeChat articles (mp.weixin.qq.com) are JS-rendered — `browser_navigate` snapshot does NOT capture full article text. Use this approach:
-
-1. `browser_navigate(url)` — navigate to the WeChat article URL (URLs like `mp.weixin.qq.com/s/xxx` are redirect URLs; navigate first to resolve the final URL)
-2. **For short articles** (< 8000 chars): `browser_console` with `document.body.innerText` — returns full text in one call
-3. **For long articles** (≥ 8000 chars): Use `document.body.innerText.slice(offset, limit)` with 8000-char windows, call multiple times with different offsets (e.g., `slice(0, 8000)`, `slice(8000, 16000)`, `slice(16000, 24000)`), then concatenate
-4. **Multi-scroll + retry on empty**: If the article has lazy-loaded images/comments below fold, scroll down with `browser_scroll(direction="down")` 2-3 times before extracting — this triggers WeChat's lazy rendering
-   - **IMPORTANT**: If `browser_console` returns empty on the first call (even after scrolling), WAIT a moment and retry. WeChat JS rendering may not have completed. Re-navigating to the URL and immediately calling `browser_console` also works as a fallback.
-   - **Worked pattern**: `browser_navigate(url)` → `browser_scroll(direction="down")` × 2 → `browser_console`
-
-5. **Image carousel articles (图片轮播)**: Some WeChat articles present content primarily as a slideshow of images (typically 5-15 images, identified by numbered pagination buttons like "1" "2" "3" ... in the snapshot). Signs:
-   - Heading exists but `document.body.innerText` returns only the title/tags/author with no article body
-   - Snapshot shows multiple page-turner buttons (数字 1-11)
-   - Most content is inside `<img>` tags rendered on a canvas
-   - **OCR limitation**: vision tools (vision_analyze) consistently fail to extract readable text from WeChat article screenshots — do not rely on OCR for these articles
-   - **Decision**: Skip scoring, inform user "图片轮播文章，正文在图片中无法提取"
-   - **If user wants to save anyway**: Save images to `assets/images/[topic]/` directory with sequential names (01-cover.jpg, 02.jpg, etc.) and create a markdown index file with `![](assets/images/...)` embeds. Update log.md with action "save" (not "ingest") and increment Total pages by count of files saved.
-
-### GitHub Blob Pages
-
-When viewing source files on GitHub (`github.com/user/repo/blob/main/path.md`):
-- **Problem**: The page includes GitHub headers, line numbers, and UI — not clean content; blob URL also requires login for some repos
-- **Solution**: Navigate to the **raw content URL**: `raw.githubusercontent.com/user/repo/main/path.md`
-- This gives clean markdown/text without any GitHub UI wrapper
-- Works for any file GitHub can render (`.md`, `.py`, `.txt`, `.json`, etc.)
-- **Always try raw first** if blob URL shows login wall or empty content
-
-### 小红书 (Xiaohongshu) Articles
-
-- 小红书 requires login/authentication and blocks anonymous access with IP risk errors
-- If you encounter error 300012 ("IP存在风险，请切换可靠网络环境后重试") or login wall — skip and notify the user
-- Alternative: ask the user to paste the article content directly
-
-### Notion Fallback (Low-Value Articles)
-
-If an article scores below threshold but the user wants to save it somewhere:
-1. Use the Notion API to create a page under the user's Notion home
-2. **Root page ID**: `34c0350f-4ef6-8160-a15d-ea85e3388083` (user's AI learning root page)
-3. Create via Python script — write the payload to a temp file, then `python3 /tmp/script.py`
-4. Example blocks structure:
-   ```python
-   blocks = [
-       {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "文章信息"}}]}},
-       {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": "URL: ..."}}]}},
-       {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "核心要点"}}]}},
-       {"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [...]}},
-   ]
-   ```
-5. API endpoint: `POST https://api.notion.com/v1/pages` with header `Authorization: Bearer $NOTION_API_KEY`
-6. The new page ID is returned in the API response — construct URL: `https://www.notion.so/{page_id_parsed}`
-
-## Wiki Save Workflow (MUST use llm-wiki skill)
-
-**CRITICAL:** Every save to the wiki MUST follow the `llm-wiki` skill standard. Load it first via `skill_view(name="llm-wiki")` before saving. The llm-wiki skill defines:
-- Frontmatter schema (title, created, updated, type, tags, sources, confidence)
-- Optional review metadata (`review_value`, `review_confidence`, `review_recommendation`, `review_stars`)
-- File layout (raw/ + entities/ + comparisons/ + concepts/)
-- Provenance markers (^[[raw/...]] on claims from specific sources)
-- Cross-reference requirements (minimum 2 wikilinks per page)
-- Index/log update requirements
-- Tag taxonomy constraints
-
-For each article judged worthy:
-
-1. **Load llm-wiki skill** via `skill_view(name="llm-wiki")` — read the full skill before saving
-2. **Navigate** to the WeChat article URL with browser
-3. **Extract** full text via `browser_console` expression: `document.body.innerText`
-4. **Create** files following llm-wiki conventions:
-   - `raw/articles/[slug].md` — original article archive with raw frontmatter (source_url, ingested, sha256)
-   - `entities/[slug].md` — entity page with full llm-wiki frontmatter + review metadata + structured summary + wikilinks to related entities
-   - `comparisons/[slug].md` — (if comparing multiple tools/systems) side-by-side comparison page
-5. **Cross-reference** — new entity pages MUST link to at least 2 existing wiki pages via `[[wikilinks]]`
-6. **Update and organize** the current wiki:
-   - update `index.md` (Total pages +N, add entry alphabetically under the right section)
-   - update `log.md` (append ingest record with file list)
-   - if the new article reveals a better navigation surface, add or refresh query/navigation pages
-   - if the touched section is getting crowded or stale, reorganize summaries/structure while you are there
-7. **Run structural lint** after saving — use the `llm-wiki` completion rule; do not report success before it passes
-8. **Reply** with the standard review format
-
-## Reply Format
-
-**IMPORTANT — Two-Phase Reply:**
-
-### Phase 1: Score first (no ingestion yet)
-```
-## [文章标题]
-
-**概要**：（200字内）
-
-**评分**：
-- 价值：X/10
-- 置信度：X/10
-
-**值得关注程度**：⭐⭐⭐（3-5个⭐）
-```
-→ If score < 49: stop here. One-line reason why not saved.
-
-### Phase 2: Ingest and confirm (only if score ≥ 49)
-After completing steps 4–7 (file creation + index/log update + lint), reply with:
-
-Template:
+Save threshold:
 
 ```text
-references/reply-template.md
+review_value * review_confidence >= 49
 ```
 
-**STRICT RULES:**
-- Phase 2 reply MUST include whether the article was successfully ingested.
-- If ingestion failed, say so explicitly and do not imply the wiki is up to date.
-- Phase 2 reply MUST include the actual file paths created or updated.
-- Phase 2 success closeout MUST include wiki page delta, index/log or structure update status, lint result, and review metadata.
-- If the agent only sends Phase 1 without Phase 2 for a score ≥49 article, that is a bug — the ingestion steps were skipped.
-- Prefer the success/failure templates in `references/reply-template.md` over ad hoc wording.
+If the product is below 49, do not save unless the user explicitly asks for a non-wiki fallback. Use `references/scoring-rubric.md` for detailed rubrics and edge adjustments.
 
-If the target wiki maintains a review queue page such as `queries/review-queue.md`,
-keep the reply metadata compatible with that queue by using the normalized
-`review_recommendation` / `review_stars` mapping from `llm-wiki`.
+## Required Workflow
 
-## Batch Processing Safety Rule
+1. Load and follow `llm-wiki` before any wiki write.
+2. Extract the article using `references/extraction-playbook.md`.
+   - If extraction fails (Cloudflare, CAPTCHA, empty body), fallback to **tinyfish-web-agent**.
+   - If extraction fails due to **paywall/subscription** (WeChat shows <1KB truncated content with no further paragraphs accessible), report extraction failure directly. Do not attempt TinyFish — the full content is inaccessible without credentials.
+3. Score with the rubric and send Phase 1.
+4. If below threshold, stop with the reason and do not create wiki files.
+5. If threshold is met, check strategic alignment using `references/strategic-alignment.md`.
+6. Save through `references/wiki-save-workflow.md`.
+7. Persist review metadata in frontmatter, never tags.
+8. Update `index.md`, `log.md`, and any relevant query/navigation page.
+9. Run structural validation before Phase 2 success.
+10. Reply using `references/reply-template.md`.
 
-When processing multiple articles in sequence, **do not begin scoring a new article until Phase 2 of the previous article is fully complete** (file creation + index update + log written + user confirmed). The scoring decision (≥49) is NOT the completion signal — file creation is.
+## Review Metadata
 
-**The failure mode this prevents:** In batch processing, it's easy to mentally conflate "decided to ingest" with "actually created the files." This happened when processing 4+ articles in sequence — Phase 1 was sent for all articles immediately, but file creation for articles 3 and 4 was skipped because Phase 2 of articles 1 and 2 hadn't been confirmed before starting articles 3 and 4.
+Use the following normalization for review metadata (canonical source — also duplicated in `llm-wiki` skill's `references/review-frontmatter-snippet.md`):
 
-**Practical rule:** Before scoring article N+1, verify that article N's log.md entry exists and contains the actual file paths. If not, complete article N's ingestion first.
+```text
+review_stars <= 2 -> do not save  (一票否决，优先于 v×c)
+review_value >= 9 and confidence >= 8 -> strong, stars 5
+review_value >= 8 and confidence >= 7 -> strong, stars 4
+review_value * review_confidence >= 49 -> worth-reading, stars 3
+reference-only retained notes -> reference, stars 1-2  (不推荐入库)
+```
 
+> [!CAUTION]
+> `review_stars <= 2` is a **hard veto** — it triggers `do not save` regardless of v×c score.
+> This prevents lifestyle/软性 content (employee perks, personal stories, product showcases)
+> from sneaking in via inflated v×c, even when the LLM assigns value=7, confidence=8 (v×c=56).
+> stars is the LLM's own honest quality signal and should always be checked first.
 
-## Duplicate Detection
+## Pitfalls
 
-When the same topic appears multiple times (e.g., Karpathy LLM Wiki covered by InfoQ, AGI Hunt, and AI寒武纪 all in the same session):
-- **First report (highest confidence source)** → evaluate and decide
-- **Second report (same content, different source)** → if content is identical, reject quickly unless it adds new incremental information
-- **Third report (same content again)** → reject unless it has genuinely new information
-- If in doubt, compare key claims against the existing wiki content before saving
+### 软性内容借 v×c 灌水入库（2026-05-20）
 
-**Same creator, multiple publishers**: When the same person (e.g., Boris Cherny on Claude Code, Karpathy on LLM Wiki) is covered by different publishers — save the most authoritative version, reject others as duplicates even if wording differs. Primary-source articles where the tool creator speaks for themselves always take priority over secondhand interpretations.
+**症状**：value=7, confidence=8, stars=3 的生活方式/个人分享类文章，v×c=56 过线入库，但实际知识密度极低。
 
-## Value Score Adjustments
+**根因**：LLM 对宏观概念（"人才竞争""员工福利"）的泛化会人为抬高 v×c，但 stars 是诚实评分，不受来源认证加成。
 
-- **Primary-source tip/trick articles**: A "feature list" article from the tool creator themselves (e.g., Boris Cherny sharing his own Claude Code workflow) may be underweighted at Value 6. Upward-adjust to Value 7 when: (a) source is the actual tool author, AND (b) contains non-obvious engineering details (specific production scale, workaround flags, undocumented combinations). 6×8=48 borderline → 7×8=56 saves.
-- **GitHub README-backed WeChat articles**: WeChat articles that are based on or directly reference GitHub README content get +1 Confidence boost (claims are cross-verifiable against source code/commits).
+**修复**：评分时先检查 stars，stars≤2 直接否决，无论 v×c 是否过线。此规则已在上述 Review Metadata 中硬编码。
 
-## Merge Logic
+### 格式欺骗：news 类文章借结构感将 c 虚标至 8（2026-05-21）
 
-If an article covers similar topic as existing wiki content:
-- **Same topic, richer content** → Overwrite the existing entity with expanded content, update frontmatter updated date
-- **Same topic, different angle** → Merge unique insights into existing entity, note the new source
-- **Duplicate without 增量** → Skip saving, inform user "已有更完整的版本"
+**症状**：量子位 AI 教育新闻文章，v=6, c=8 = 48，本应被 Gate 拦住，但 c=8 来自"格式完整"（案例列表、来源标注、OpenAI 背书），并非技术深度。最终入库后发现无任何技术细节。
 
-## Key Files Reference
+**根因**：Confidence rubric 定义 c=8 为"Original work from known technical communities / Named author, practical experience"。新闻报道可以有 named examples 和 credible-looking citations，但这些佐证的是"事件"而非"可复用的技术知识"。c 衡量的是评分者对信息*可验证性和可操作性*的信心，不是格式完整度。
 
-- Wiki location: `~/wiki` (this IS the Obsidian vault)
-- Wiki structure: `entities/`, `raw/`, `comparisons/`, `concepts/`, `queries/`, `_archive/`
-- Wikilink format: always use `[[subdir/basename]]` (e.g., `[[entities/hermes-agent]]`), never bare `[[basename]]`
-- After saving: always update `index.md` (Total pages +N) and `log.md` (append ingest record)
+**触发路径**：
+1. 文章为 news 类型（有案例、事件、案例演示，无技术细节）
+2. Scorer 看到结构完整（标题层级、列表、来源标注）→ 给 c 高分
+3. 同时 v 给了 6（中等价值，有一定信息量）→ 6×8=48，刚好在阈值线下 1 分
+4. 边界案例未被拦截，自动入库
+
+**修复（三层防御）**：
+1. Content-type detection 必须作为评分第一步：news 类文章 confidence 上限为 6
+2. v/c mismatch correction：c≥8 + v≤5 → cap v at c-2（格式欺骗信号）
+3. 边界案例 46≤v×c≤52 必须上报用户确认，不得自动入库
+
+**鉴别方法**：问自己——"读完这篇文章，我能直接复用/验证什么？"如果答案只是"知道有这么个事"，则是 news 类，confidence 不应超过 6。
+
+Persist review metadata in entity page frontmatter only (never in tags):
+
+```yaml
+review_value: 8
+review_confidence: 7
+review_recommendation: strong   # strong | worth-reading | reference
+review_stars: 4                 # optional, 1-5 for quick visual scanning
+```
+
+## Completion Gate
+
+Phase 2 success requires all of the following:
+- raw source and synthesized wiki files created or updated correctly
+- review metadata persisted where applicable
+- `index.md` and `log.md` updated
+- structural/navigation changes considered and applied when useful
+- validation passed
+- actual file paths included in the closeout
+
+If any item is missing, Phase 2 must be a failure closeout with a single explicit blocker.
+
+## Batch Safety
+
+When multiple URLs are provided, process one article through full Phase 2 closeout before scoring the next. The scoring decision is not the completion signal. See `references/batch-safety.md`.
+
+## Failure Semantics
+
+- If extraction fails, try **TinyFish** (`tinyfish-web-agent` skill) as fallback before reporting failure.
+- If TinyFish also fails, report extraction failure and do not score.
+- If the article is an image carousel that cannot be extracted, say so explicitly.
+- If validation fails, do not claim the wiki is updated.
+- If a qualifying article is not ingested, say `落库状态：failed` and name the blocker.
+## WeChat Inbox Processing (Batch Mode)
+
+当从 `raw/wechat-inbox/` 批量处理微信文章时：
+
+### 流程
+
+1. **检查已入库**：先对比 `entities/` 和 `raw/articles/`，跳过已存在的文章
+2. **Heuristic 预过滤**（可选）：用文件内容长度、关键词快速排除明显低价值文章（减少 LLM 调用量）
+3. **构建批量评分 prompt**：将待评分文章的前 3000 字符 + 标题组合，写入 `raw/email-inbox/wechat-batch-scoring-prompt.md`
+4. **调用 LLM 评分**：使用 Baidu Qianfan API（`deepseek-v4-flash` 模型），endpoint `https://qianfan.baidubce.com/v2/coding/chat/completions`
+5. **解析 JSON 结果**：`value × confidence >= 49` → 入库；否则拒绝
+6. **入库处理**：对通过评分的文章，从 inbox 移动到 `raw/articles/`，创建 entity 页面，更新 `index.md`
+7. **清理 inbox**：删除已处理的文件（无论入库还是拒绝）
+8. **清理临时文件**：删除 `wechat-batch-scoring-prompt.md`
+
+### 评分 API 配置
+
+```python
+api_url = 'https://qianfan.baidubce.com/v2/coding/chat/completions'
+api_key = 'YOUR_BCE_V3_API_KEY'  # 在 config.yaml 的 custom_providers 下
+model = 'deepseek-v4-flash'
+```
+
+### 批量评分 prompt 格式
+
+```
+你是一个技术文章质量评估助手。请评估以下文章是否值得入库到技术知识库。
+
+评分标准：
+- 价值(1-10)：技术深度、独特见解、实用价值、信息密度
+- 置信度(1-10)：内容是否清晰可判断
+- 入库：value×confidence ≥ 49 或有独特技术洞察
+
+只输出JSON数组，不要输出其他内容：
+[{"title": "...", "value": N, "confidence": N, "ingest": true/false, "reason": "..."}]
+
+---
+## {文章标题}
+{前3000字符内容}
+---
+```
+
+### 注意事项
+
+- **不要对已入库文章重复评分**：先检查 `entities/` 和 `raw/articles/`，避免重复工作
+- **批量大小**：19-20 篇/次是合理上限（响应长度 ~3000-6000 chars，API 超时 ~60-120s）
+- **Heuristic 预过滤**：文件 <1KB、纯标题/空内容、明显新闻/公告 → 直接拒绝，不调 LLM
+- **评分后清理**：无论入库还是拒绝，都要从 inbox 删除已处理文件
+
+### WeChat 文件名含空格处理
+
+微信文件名常见空格（如 `腾讯员工公寓曝光竟是这样的布置.md`），使用 xargs pipeline：
+
+```bash
+cd /Users/jinguo/wiki/raw/wechat-inbox
+ls -1 | grep "filename" | xargs -I {} cp "{}" /Users/jinguo/wiki/raw/articles/
+```
+
+### MiniMax API ` thinks` 标签处理
+
+`minimax-cn/MiniMax-M2-7` 返回的 JSON 响应中，`content` 字段值被包裹在 ` thinks` XML 标签内。必须先 strip 再提取 JSON：
+
+```python
+raw = re.sub(r'<thinks>.*?</thinks>', '', raw, flags=re.DOTALL)
+data = json.loads(raw)
+```
+
+### MiniMax 配额耗尽时的即时回退（2026-05-17 实践）
+
+当 MiniMax 返回 `NotEnoughCvError (code 11210)` 时，**不要停掉 pipeline**，立即切换到 `deepseek-chat` 继续评分：
+
+```python
+# 检测配额耗尽
+if "NotEnoughCvError" in error or error.get("code") == 11210:
+    # 切换到 deepseek-chat（需配置 deepseek provider）
+    model = "deepseek-chat"
+    # 继续评分，不中断批量流程
+```
+
+**注意**：这与 `thinks` 标签问题不同——配额耗尽是账户级限制（Token Plan Plus 15000/15000），会返回明确的 HTTP 错误码 11210，而非格式损坏。MiniMax 配额通常每日/每月重置，回退模型只是临时方案。
+
+### Xunfei MAAS API 端点状态（2026-05-17 更新）
+
+旧端点 `maas.lance4.ai` 已失效（DNS NXDOMAIN）。正确端点 `https://maas-coding-api.cn-huabei-1.xf-yun.com/v2` **可用于简单评分请求**（如 JSON 评分 prompt），但可能返回 One API HTML 页面用于复杂请求。
+
+配置在 `config.yaml` 的 `custom_providers` 下，name 为 `maas`，model 为 `astron-code-latest`。
+
+**降级策略**：当 MiniMax 配额耗尽时，先尝试 Xunfei endpoint 做简单评分。如果返回 HTML 非 JSON，再切换到 `deepseek-chat`。不要反复尝试不可用的 Xunfei 端点。
+
+### Jina Reader 批量抓取 Cloudflare 拦截（2026-05-17 实践）
+
+当一次性通过 Jina Reader 抓取 20+ URL 时，大部分会返回 46 字符（Cloudflare 拦截）。这不是内容问题而是限流。应对策略：
+- 单次批量不超过 ~10 个 URL
+- 若多数返回 46 字符，切换到 curl 逐个抓取剩余 URL
+- 关键 URL（高价值/高评分候选）优先用 curl 直接抓取
+
+## Progressive References
+
+- `references/scoring-rubric.md` — value/confidence scoring tables and adjustment rules.
+- `references/extraction-playbook.md` — extraction methods and source-specific failure modes.
+- `references/wiki-save-workflow.md` — llm-wiki save steps, metadata, index/log, validation.
+- `references/batch-safety.md` — multi-article sequencing and skipped-ingest prevention.
+- `references/reply-template.md` — mandatory Phase 1 and Phase 2 response formats.
+
+## References
+
+- `references/wechat-inbox-handling.md` — Handling Chinese filenames with spaces in shell commands
